@@ -1,5 +1,5 @@
 // Finance Tracker service worker: works offline, receives shared PDFs.
-const VERSION = 'ft-v1';
+const VERSION = 'ft-v2';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './pdf.min.js', './pdf.worker.min.js'];
 
 self.addEventListener('install', e => {
@@ -30,7 +30,8 @@ self.addEventListener('fetch', e => {
   if (url.origin !== location.origin) return;
   // App files: answer from cache instantly, refresh the cache in the background (updates show on next open)
   e.respondWith(caches.open(VERSION).then(async c => {
-    const req = e.request.mode === 'navigate' ? './index.html' : e.request;
+    const isPage = e.request.mode === 'navigate' && (url.pathname.endsWith('/') || url.pathname.endsWith('.html'));
+    const req = isPage ? './index.html' : e.request;
     const cached = await c.match(req, { ignoreSearch: true });
     const net = fetch(e.request).then(r => { if (r.ok) c.put(req, r.clone()); return r; }).catch(() => cached);
     return cached || net;

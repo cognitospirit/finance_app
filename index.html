@@ -250,6 +250,7 @@ body[data-route="welcome"]{padding-bottom:20px}
   <button data-to="insights"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Insights</button>
   <button data-to="more"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></svg>More</button>
 </nav>
+<input type="file" accept="application/pdf,.pdf" id="pdfIn" hidden><input type="file" accept="application/json,.json" id="restoreIn" hidden>
 <div id="sheet"></div><div id="confirm"></div><div id="toast" role="status" aria-live="polite"></div>
 <script>
 // ---- Paytm statement parser (pure; input = pages of {str,x,y}) ----
@@ -1215,7 +1216,10 @@ async function readPdf(buf, password) {
   return pages;
 }
 async function importFile(file) {
-  UI.route = 'import'; location.hash = '#import';
+  try { await importFileInner(file); } catch (e) { toast('Import failed: ' + (e && e.message || e)); UI.importSession = null; render(); }
+}
+async function importFileInner(file) {
+  UI.route = 'import'; if (location.hash !== '#import') history.replaceState(null, '', '#import'); render();
   $('#view').innerHTML = `<section class="card empty"><h3>Reading ${esc(file.name)}…</h3><p class="muted">This stays on your phone.</p></section>`;
   const buf = await file.arrayBuffer(); let pages, password;
   for (let tries = 0; tries < 4; tries++) {
@@ -1244,7 +1248,7 @@ function viewImport() {
   const ses = UI.importSession;
   if (!ses) {
     let h = `<section class="card"><h3>Import a Paytm UPI statement</h3><p class="muted">In Paytm: Balance & History → Download statement → PDF. Then choose it here, or share it straight from Paytm or Files to Finance Tracker.</p>
-      <label class="btn primary wide filebtn">Choose PDF<input type="file" accept="application/pdf,.pdf" id="pdfIn" hidden></label>
+      <button class="btn primary wide" data-act="pick-pdf">Choose PDF</button>
       <p class="muted small">You'll check every payment before anything is added. Payments already imported are skipped automatically.</p></section>`;
     const hist = [...S.imports].reverse();
     if (hist.length) h += `<section class="card list"><div class="card-h"><h3>Past imports</h3></div>${hist.map(i => `<div class="brow"><div class="grow"><b>${esc(i.file)}</b><div class="small muted">${i.count} payments, ${fmt(i.total)}, added ${new Date(i.at).toLocaleDateString('en-IN')}${i.undone ? ', undone' : ''}</div></div>${i.undone ? '' : `<button class="btn sm" data-act="imp-undo" data-id="${i.id}">Undo</button>`}</div>`).join('')}</section>`;
@@ -1313,7 +1317,7 @@ function viewData() {
     ${FS_OK ? `<div class="row gap wrap"><button class="btn" data-act="file-new">${st.file ? 'Save to a new file' : 'Create data file'}</button><button class="btn" data-act="file-open">Open another file</button></div>
     <p class="muted small">Android's file picker shows the folder; the file name tells you which one is in use. Copy this file to Drive or WhatsApp yourself any time.</p>` : ''}</section>`;
   h += `<section class="card"><div class="card-h"><h3>Backup copies</h3></div>
-    <div class="row gap wrap"><button class="btn" data-act="backup-save">Save a backup copy</button><label class="btn filebtn">Restore from a file<input type="file" accept="application/json,.json" id="restoreIn" hidden></label><button class="btn" data-act="csv">Export CSV</button></div>
+    <div class="row gap wrap"><button class="btn" data-act="backup-save">Save a backup copy</button><button class="btn" data-act="pick-json">Restore from a file</button><button class="btn" data-act="csv">Export CSV</button></div>
     <p class="muted small">The app also keeps a copy of your data from each of the last 30 days you used it, plus a copy made before any restore or erase:</p><div id="snaps" class="list">Loading…</div></section>`;
   h += `<section class="card"><div class="card-h"><h3>Start over</h3></div><p class="muted small">Erases all transactions, bills and settings in the app and the data file. Backup copies are kept.</p><button class="btn danger-t" data-act="erase">Erase all data</button></section>`;
   setTimeout(async () => {
@@ -1423,6 +1427,8 @@ const ACT = {
   'imp-filter': el => { UI.impFilter = el.dataset.f; render(); },
   'imp-cancel': () => { UI.importSession = null; render(); },
   'imp-commit': () => importCommit(), 'imp-undo': el => importUndo(el.dataset.id),
+  'pick-pdf': () => { const i = $('#pdfIn'); i.value = ''; i.click(); },
+  'pick-json': () => { const i = $('#restoreIn'); i.value = ''; i.click(); },
   'file-new': () => createDataFile(), 'file-open': () => openDataFile(),
   'backup-save': () => downloadBackup(), csv: () => exportCsv(),
   'snap-restore': el => { const s = snapCache[+el.dataset.i]; restoreState(s.state, 'the copy from ' + niceDay(s.day) + (s.time ? ' ' + s.time : '')); },
@@ -1482,7 +1488,8 @@ document.addEventListener('input', e => {
 });
 window.addEventListener('hashchange', () => { closeSheet(); parseHash(); render(); });
 window.addEventListener('popstate', e => { if ($('#sheet').classList.contains('open') && !(history.state && history.state.sheet)) { const el = $('#sheet'); el.classList.remove('open'); el.innerHTML = ''; } });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S) render(); });
+let lastDay = todayKey();
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S && todayKey() !== lastDay && !$('#sheet').classList.contains('open') && !UI.importSession) { lastDay = todayKey(); render(); } });
 
 // ================= Start =================
 async function start() {
