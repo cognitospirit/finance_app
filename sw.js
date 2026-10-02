@@ -1,5 +1,5 @@
 // Finance Tracker service worker: works offline, receives shared PDFs.
-const VERSION = 'ft-v2';
+const VERSION = 'ft-v3';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './pdf.min.js', './pdf.worker.min.js'];
 
 self.addEventListener('install', e => {

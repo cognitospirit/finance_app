@@ -234,6 +234,12 @@ body[data-route="import"] #fab{display:none}
 body[data-route="welcome"]{padding-bottom:20px}
 .btn:disabled{opacity:.45}
 
+.gauge-wrap{position:relative;max-width:330px;margin:0 auto}
+.gauge-num{position:absolute;left:0;right:0;bottom:38px;text-align:center;font-family:var(--display);font-size:30px;font-weight:750}
+.gauge{margin-top:4px}
+.legend-line .sw{width:10px;height:10px;border-radius:3px;display:inline-block;margin-left:6px}.legend-line .sw:first-child{margin-left:0}
+.seg button{font-size:14px}
+
 </style>
 </head>
 <body>
@@ -367,6 +373,7 @@ const PALETTE = ['#2E7D5B', '#D9822B', '#3B6FD8', '#8E44AD', '#C2185B', '#00897B
 function seedState() {
   const D = (name, kind, color, subs) => ({ id: uid(), name, kind, color, limitMode: 'amt', limit: 0, pct: 0, rollover: 'off', alerts: true, archived: false, subs: subs.map(n => ({ id: uid(), name: n })) });
   const divs = [
+    D('Rent', 'fixed', '#6D4C41', []),
     D('Investment', 'savings', '#5C6BC0', ['SIP', 'Stocks']),
     D('FD', 'savings', '#00897B', []),
     D('Utilities', 'expense', '#B07D10', ['Household', 'Bills', 'Mobile']),
@@ -392,8 +399,8 @@ function seedState() {
   };
   return {
     app: 'financeTracker', schema: 1, savedAt: null,
-    settings: { cycleStartDay: 1, nearPct: 80, atRiskPct: 5, overPct: 15, underPct: 70, theme: 'system', onboarded: false },
-    salary: [], income: [], divisions: divs, overrides: {}, txns: [], bills: [], tagMap, rules: [], imports: []
+    settings: { cycleStartDay: 1, nearPct: 80, atRiskPct: 5, overPct: 15, underPct: 70, theme: 'system', onboarded: false, fixedIntro: true },
+    salary: [], income: [], divisions: divs, overrides: {}, txns: [], bills: [], tagMap, rules: [], imports: [], dismissedLinks: []
   };
 }
 
@@ -414,7 +421,20 @@ const saveStatus = { state: 'idle', at: null, file: null, err: null }; // saving
 let saveTimer = null;
 
 function validState(o) { return o && o.app === 'financeTracker' && Array.isArray(o.txns) && Array.isArray(o.divisions); }
-function migrate(o) { const base = seedState(); for (const k of Object.keys(base)) if (o[k] === undefined) o[k] = base[k]; o.settings = Object.assign({}, base.settings, o.settings); return o; }
+function migrate(o) {
+  const needFixed = !(o.settings && o.settings.fixedIntro);
+  const base = seedState(); for (const k of Object.keys(base)) if (o[k] === undefined) o[k] = base[k]; o.settings = Object.assign({}, base.settings, o.settings);
+  if (needFixed) { // v2: fixed costs. Add a Rent division and a monthly rent bill due on the 1st.
+    if (!o.divisions.some(d => d.kind === 'fixed')) {
+      const rent = { id: uid(), name: 'Rent', kind: 'fixed', color: '#6D4C41', limitMode: 'amt', limit: 4000000, pct: 0, rollover: 'off', alerts: true, archived: false, subs: [] };
+      o.divisions.unshift(rent);
+      const d = new Date(); const ym = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+      o.bills.push({ id: uid(), name: 'Rent', amt: 4000000, varies: false, div: rent.id, sub: null, every: 1, dueDay: 1, start: ym, end: '', match: '', paused: false, paid: {}, skipped: [] });
+    }
+    o.settings.fixedIntro = true;
+  }
+  return o;
+}
 const countEntries = o => (o.txns || []).length;
 
 async function loadState() {
@@ -538,6 +558,7 @@ const inPeriod = (dt, p) => { const k = dt.slice(0, 10); return k >= p.start && 
 function salaryFor(pk) { let v = 0; for (const s of [...S.salary].sort((a, b) => a.from.localeCompare(b.from))) if (s.from <= pk) v = s.amt; return v; }
 function extraIncome(pk) { return S.income.filter(i => i.period === pk).reduce((a, i) => a + i.amt, 0); }
 const activeDivs = () => S.divisions.filter(d => !d.archived);
+const KIND_LABEL = { expense: 'flexible', fixed: 'fixed cost', savings: 'saving target' };
 const divById = id => S.divisions.find(d => d.id === id);
 const subName = (d, sid) => (d && d.subs.find(s => s.id === sid) || {}).name || '';
 
@@ -661,9 +682,63 @@ function savingsStatus(d, p) {
   return { limit: L, saved, due, status };
 }
 const STATUS = {
+  comfy: ['Comfortable', 'under'], paid: ['Paid', 'ok'], due: ['Not paid yet', 'none'], overdue: ['Overdue', 'over'], fixedover: ['Higher than planned', 'risk'],
   ok: ['On track', 'ok'], risk: ['At risk', 'risk'], over: ['Overshooting', 'over'], under: ['Undershooting', 'under'], none: ['No limit set', 'none'],
   met: ['Target met', 'ok'], way: ['On the way', 'under'], behind: ['Behind target', 'risk']
 };
+
+// ---- Fixed costs ----
+function fixedStatus(d, p) {
+  const L = limitFor(d, p), paid = spentFor(d.id, p);
+  const occ = S.bills.filter(b => b.div === d.id).flatMap(b => billOccurrences(b, p.start, p.end));
+  const overdue = occ.filter(o => o.status === 'overdue'), open = occ.filter(o => ['due', 'today', 'overdue'].includes(o.status));
+  const due = open.reduce((a, o) => a + o.expected, 0);
+  const expected = Math.max(L, paid + due);
+  const extra = L > 0 ? Math.max(0, paid + due - L) : 0;
+  let status;
+  if (overdue.length) status = 'overdue';
+  else if (L > 0 && paid + due > L * 1.02) status = 'fixedover';
+  else if (open.length) status = 'due';
+  else if (paid > 0) status = 'paid';
+  else status = L > 0 ? 'due' : 'none';
+  const next = open.sort((a, b) => a.due.localeCompare(b.due))[0];
+  return { limit: L, paid, due, expected, extra, status, next };
+}
+// ---- Overall weighted pace (flexible divisions, weighted by their limits) ----
+function paceOverall(p) {
+  const st = S.settings; let L = 0, F = 0, spent = 0, anyOver = false, early = false;
+  for (const d of activeDivs().filter(x => x.kind === 'expense')) {
+    const f = forecast(d, p); spent += f.spent;
+    if (f.limit > 0) { L += f.limit; F += f.forecast; if (f.spent > f.limit) anyOver = true; }
+    else F += f.forecast;
+    if (!f.past && !f.future && f.t <= 3) early = true;
+  }
+  const un = forecast(null, p, { all: new Set([null]), limit: 0 }); F += un.forecast; spent += un.spent;
+  const extra = activeDivs().filter(x => x.kind === 'fixed').reduce((a, d) => a + fixedStatus(d, p).extra, 0);
+  if (!L) return { score: null, L, F, extra, spent, status: 'none' };
+  const score = (F + extra) / L * 100;
+  let status = score > 100 + st.overPct ? 'over' : score > 100 + st.atRiskPct ? 'risk' : score < 95 ? 'comfy' : 'ok';
+  if (early && !anyOver && (status === 'over' || status === 'risk')) status = 'ok';
+  return { score, L, F, extra, spent, status, early };
+}
+// ---- Payments that look like a bill but aren't linked yet ----
+function billLinkSuggestions(p) {
+  const out = []; const used = new Set();
+  for (const b of S.bills) {
+    for (const o of billOccurrences(b, p.start, p.end)) {
+      if (o.status === 'paid' || o.status === 'skipped') continue;
+      const t = S.txns.filter(t => !t.bill && !t.excl && t.dir === 'D' && !used.has(t.id) && !(S.dismissedLinks || []).includes(t.id + '|' + b.id)
+        && Math.abs(t.amt - o.expected) <= o.expected * 0.1 && Math.abs(daysBetween(o.due, t.dt.slice(0, 10))) <= 7).sort((x, y) => Math.abs(x.amt - o.expected) - Math.abs(y.amt - o.expected))[0];
+      if (t) { used.add(t.id); out.push({ bill: b, due: o.due, txn: t }); }
+    }
+  }
+  return out;
+}
+function linkTxnToBill(txnId, billId, due) {
+  const t = S.txns.find(x => x.id === txnId), b = S.bills.find(x => x.id === billId); if (!t || !b) return;
+  t.bill = { id: b.id, due }; if (b.div) { t.div = b.div; t.sub = b.sub || null; }
+  b.paid = b.paid || {}; b.paid[due] = t.id;
+}
 
 // ---- Categorisation ----
 function categorise(row) {
@@ -778,6 +853,18 @@ function lineChart(items, unit = '%') { // {label, value} value numbers
   return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Share of salary saved each period"><line x1="${L}" x2="${W}" y1="${H - B}" y2="${H - B}" stroke="var(--line)"/><polyline points="${pts}" fill="none" stroke="var(--ok)" stroke-width="2.4"/>${dots}</svg>`;
 }
 
+function paceGauge(pc) { // semicircle 0–150%
+  const W = 330, H = 172, cx = 165, cy = 150, R = 118, w = 22; const st = S.settings;
+  const ang = v => Math.PI * (1 - Math.min(150, Math.max(0, v)) / 150);
+  const pt = (r, v) => `${cx + r * Math.cos(ang(v))},${cy - r * Math.sin(ang(v))}`;
+  const arc = (a, b, col) => `<path d="M${pt(R, a)} A${R},${R} 0 0 1 ${pt(R, b)} L${pt(R - w, b)} A${R - w},${R - w} 0 0 0 ${pt(R - w, a)} Z" fill="${col}"/>`;
+  const zones = arc(0, 95, 'var(--under)') + arc(95, 100 + st.atRiskPct, 'var(--ok)') + arc(100 + st.atRiskPct, 100 + st.overPct, 'var(--risk)') + arc(100 + st.overPct, 150, 'var(--over)');
+  const v = pc.score == null ? 0 : pc.score;
+  const needle = pc.score == null ? '' : `<line x1="${cx}" y1="${cy}" x2="${pt(R - w - 8, v).split(',')[0]}" y2="${pt(R - w - 8, v).split(',')[1]}" stroke="var(--ink)" stroke-width="4" stroke-linecap="round"/><circle cx="${cx}" cy="${cy}" r="8" fill="var(--ink)"/>`;
+  const ticks = [0, 100, 150].map(t => `<text x="${pt(R + 12, t).split(',')[0]}" y="${+pt(R + 12, t).split(',')[1] + 4}" text-anchor="middle" class="ax">${t}%</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart gauge" role="img" aria-label="Overall pace ${pc.score == null ? 'not available' : Math.round(v) + ' percent'}">${zones}${ticks}<g opacity=".25">${arc(99.4, 100.6, 'var(--ink)')}</g>${needle}</svg>`;
+}
+
 // ================= App-level UI state =================
 const UI = { periodOffset: 0, route: 'home', param: null, actFilter: 'all', actDiv: '', actSearch: '', onb: 1, importSession: null, impFilter: 'all' };
 const curPeriod = () => shiftPeriod(periodOf(todayKey()), UI.periodOffset);
@@ -785,6 +872,7 @@ const chip = (status) => { const [t, c] = STATUS[status]; return `<span class="c
 const dot = c => `<span class="dot" style="background:${c}"></span>`;
 const expenseDivs = () => activeDivs().filter(d => d.kind === 'expense');
 const savingsDivs = () => activeDivs().filter(d => d.kind === 'savings');
+const fixedDivs = () => activeDivs().filter(d => d.kind === 'fixed');
 
 function overall(p) {
   const ids = new Set([...expenseDivs().map(d => d.id), null]);
@@ -798,44 +886,64 @@ function strip(label, pct, val, marker) {
 function firstDataKey() { const ds = S.txns.map(t => t.dt).sort(); return ds.length ? periodOf(ds[0].slice(0, 10)).key : curPeriod().key; }
 // ---------------- Home ----------------
 function viewHome() {
-  const p = curPeriod(); const { ids, f } = overall(p);
+  const p = curPeriod(); const { ids, f } = overall(p); const pc = paceOverall(p);
   const sal = salaryFor(p.key) + extraIncome(p.key);
   const saved = savingsDivs().reduce((a, d) => a + spentFor(d.id, p), 0);
+  const fixed = fixedDivs().map(d => ({ d, s: fixedStatus(d, p) }));
+  const fixedPaid = fixed.reduce((a, x) => a + x.s.paid, 0), fixedPlan = fixed.reduce((a, x) => a + x.s.expected, 0);
   const left = f.limit - f.spent;
   const tPct = f.past ? 100 : f.future ? 0 : f.t / f.N * 100;
   const uPct = f.limit ? f.spent / f.limit * 100 : 0;
-  const setupNeeded = !sal && !f.limit;
-  let h = '';
-  h += fileBanner();
-  if (setupNeeded) h += `<section class="card empty"><h3>Start with your salary and limits</h3><p>Set your monthly salary and how much each division can spend. Everything else builds on that.</p><button class="btn primary" data-act="go" data-to="welcome" data-step="2">Set up budget</button></section>`;
+  const live = !f.past && !f.future;
+  let h = fileBanner();
+  if (!sal && !f.limit) h += `<section class="card empty"><h3>Start with your salary and limits</h3><p>Set your monthly salary and how much each division can spend. Everything else builds on that.</p><button class="btn primary" data-act="go" data-to="welcome" data-step="2">Set up budget</button></section>`;
+  // hero: flexible money only
   h += `<section class="hero">
-    <div class="hero-top"><span>${f.limit ? (left >= 0 ? 'Left to spend' : 'Over budget by') : 'Spent'}</span>${f.limit ? chip(f.status) : ''}</div>
+    <div class="hero-top"><span>${f.limit ? (left >= 0 ? 'Flexible money left' : 'Flexible spending over by') : 'Flexible spending'}</span>${pc.score != null ? chip(pc.status) : ''}</div>
     <div class="hero-num">${f.limit ? fmtR(Math.abs(left)) : fmtR(f.spent)}</div>
-    <p class="hero-sub">${f.past ? `You spent ${fmtR(f.spent)} of ${fmtR(f.limit)}.` : f.future ? 'This period hasn\'t started.' : f.limit ? (left > 0 ? `About <b>${fmtR(f.safePerDay)} a day</b> keeps you within budget. Expected by ${shortDay(p.end)}: <b>${fmtR(f.forecast)}</b>.` : `Expected by ${shortDay(p.end)}: <b>${fmtR(f.forecast)}</b>.`) : 'Set division limits on the Budget tab to see what\'s left.'}</p>
+    <p class="hero-sub">${f.past ? `You spent ${fmtR(f.spent)} of ${fmtR(f.limit)} on flexible divisions.` : f.future ? 'This period hasn\'t started.' : f.limit ? (left > 0 ? `About <b>${fmtR(f.safePerDay)} a day</b> keeps you within ${fmtR(f.limit)}. Expected by ${shortDay(p.end)}: <b>${fmtR(f.forecast)}</b>.` : `Expected by ${shortDay(p.end)}: <b>${fmtR(f.forecast)}</b>.`) : 'Set limits for your flexible divisions on the Budget tab.'}</p>
     ${strip('Period gone', tPct, f.past ? 'done' : f.future ? '0 days' : `${f.t} of ${f.N} days`)}
-    ${f.limit ? strip('Budget used', uPct, `${Math.round(uPct)}%`, tPct) : ''}
+    ${f.limit ? strip('Flexible budget used', uPct, `${Math.round(uPct)}%`, tPct) : ''}
   </section>`;
-  h += `<section class="trio"><div><span>Salary</span><b>${fmtR(sal)}</b></div><div><span>Spent</span><b>${fmtR(f.spent)}</b></div><div><span>Saved</span><b>${fmtR(saved)}</b></div></section>`;
+  h += `<section class="trio"><div><span>Salary</span><b>${fmtR(sal)}</b></div><div><span>Fixed paid</span><b>${fmtR(fixedPaid)}</b></div><div><span>Saved</span><b>${fmtR(saved)}</b></div></section>`;
   // banners
   const review = txnsIn(p).filter(t => !t.div && !t.excl && t.dir === 'D').length;
   if (review) h += `<button class="banner warn" data-act="go" data-to="activity" data-filter="review">${review} transaction${review > 1 ? 's need' : ' needs'} a division. Tap to sort them.</button>`;
-  if (!f.past && !f.future) {
+  for (const sg of billLinkSuggestions(p)) h += `<button class="banner" data-act="link-bill" data-t="${sg.txn.id}" data-b="${sg.bill.id}" data-due="${sg.due}">Is ${fmtR(sg.txn.amt)}${sg.txn.payee ? ' to ' + esc(sg.txn.payee) : ''} on ${shortDay(sg.txn.dt)} your <b>${esc(sg.bill.name)}</b>? Tap to mark it paid.</button>`;
+  if (live) {
     for (const d of expenseDivs()) {
       if (!d.alerts) continue; const L = limitFor(d, p); if (!L) continue; const sp = spentFor(d.id, p);
       if (sp > L) h += `<button class="banner over" data-act="go" data-to="div" data-id="${d.id}">${esc(d.name)} is ${fmtR(sp - L)} over its limit.</button>`;
       else if (sp >= L * S.settings.nearPct / 100) h += `<button class="banner warn" data-act="go" data-to="div" data-id="${d.id}">${esc(d.name)}: ${Math.round(sp / L * 100)}% used, ${fmtR(L - sp)} left for ${f.daysLeft + 1} days.</button>`;
     }
+    for (const x of fixed) if (x.d.alerts && x.s.status === 'overdue') h += `<button class="banner over" data-act="go" data-to="div" data-id="${x.d.id}">${esc(x.d.name)} is overdue.</button>`;
   }
-  h += `<section class="card"><div class="card-h"><h3>This period</h3><span class="muted">${p.label}</span></div>${burnChart({ p, daily: dailyAll(ids, p), f, label: 'All spending' })}
+  // overall weighted pace
+  if (pc.score != null) {
+    const why = live ? `Your flexible divisions are expected to use <b>${Math.round(pc.score)}%</b> of their ${fmtR(pc.L)} together. Bigger divisions count more.` : `Your flexible divisions used <b>${Math.round(pc.score)}%</b> of their ${fmtR(pc.L)}.`;
+    h += `<section class="card"><div class="card-h"><h3>Overall pace</h3>${chip(pc.status)}</div>
+      <div class="gauge-wrap">${paceGauge(pc)}<div class="gauge-num">${Math.round(pc.score)}%</div></div>
+      <p class="small">${why}${pc.extra ? ` Includes ${fmtR(pc.extra)} more than planned on fixed costs.` : ''}${pc.early && live ? ' Early in the period, so this will settle over the next few days.' : ''}</p>
+      <p class="legend-line small"><span class="sw" style="background:var(--under)"></span>under 95% comfortable <span class="sw" style="background:var(--ok)"></span>on track <span class="sw" style="background:var(--risk)"></span>at risk <span class="sw" style="background:var(--over)"></span>overshooting</p></section>`;
+  }
+  // fixed costs
+  if (fixed.length) {
+    h += `<section class="card list"><div class="card-h"><h3>Fixed costs</h3><span class="muted small">${fmtR(fixedPaid)} of ${fmtR(fixedPlan)} paid</span></div>`;
+    for (const { d, s } of fixed) {
+      h += `<button class="drow" data-act="go" data-to="div" data-id="${d.id}"><div class="drow-1">${dot(d.color)}<b>${esc(d.name)}</b>${chip(s.status)}</div>
+        <div class="drow-2"><span>${fmtR(s.paid)}${s.limit ? ` <span class="muted">of ${fmtR(s.limit)}</span>` : ''}</span><span class="muted">${s.next ? (s.next.status === 'overdue' ? 'was due ' : 'due ') + niceDay(s.next.due) : s.status === 'paid' ? '✓' : ''}</span></div></button>`;
+    }
+    h += `</section>`;
+  }
+  h += `<section class="card"><div class="card-h"><h3>Flexible spending</h3><span class="muted">${p.label}</span></div>${burnChart({ p, daily: dailyAll(ids, p), f, label: 'Flexible spending' })}
     <p class="legend-line"><span class="lg solid"></span>spent <span class="lg dash"></span>expected <span class="lg lim"></span>limit</p></section>`;
-  // divisions
-  h += `<section class="card list"><div class="card-h"><h3>Divisions</h3><button class="link" data-act="go" data-to="budget">Edit</button></div>`;
+  h += `<section class="card list"><div class="card-h"><h3>Flexible divisions</h3><button class="link" data-act="go" data-to="budget">Edit</button></div>`;
   for (const d of expenseDivs()) {
     const df = forecast(d, p); const pct = df.limit ? df.spent / df.limit * 100 : 0;
     h += `<button class="drow" data-act="go" data-to="div" data-id="${d.id}">
       <div class="drow-1">${dot(d.color)}<b>${esc(d.name)}</b>${chip(df.status)}</div>
-      <div class="drow-2"><span>${fmtR(df.spent)}${df.limit ? ` <span class="muted">of ${fmtR(df.limit)}</span>` : ''}</span><span class="muted">${df.limit && !df.past && !df.future ? (df.limit - df.spent - df.billsDue > 0 ? `${fmtR(df.safePerDay)}/day` : 'nothing left') : ''}</span></div>
-      <div class="bar"><i style="width:${Math.min(100, pct)}%;background:${d.color}"></i>${df.limit && !df.past && !df.future ? `<em style="left:${tPct}%"></em>` : ''}</div>
+      <div class="drow-2"><span>${fmtR(df.spent)}${df.limit ? ` <span class="muted">of ${fmtR(df.limit)}</span>` : ''}</span><span class="muted">${df.limit && live ? (df.limit - df.spent - df.billsDue > 0 ? `${fmtR(df.safePerDay)}/day` : 'nothing left') : ''}</span></div>
+      <div class="bar"><i style="width:${Math.min(100, pct)}%;background:${d.color}"></i>${df.limit && live ? `<em style="left:${tPct}%"></em>` : ''}</div>
     </button>`;
   }
   const un = unassignedSpent(p);
@@ -851,10 +959,9 @@ function viewHome() {
     }
     h += `</section>`;
   }
-  // bills
   const ub = upcomingBills(7);
   h += `<section class="card list"><div class="card-h"><h3>Bills due soon</h3><button class="link" data-act="go" data-to="bills">All bills</button></div>`;
-  h += ub.length ? ub.map(billOccRow).join('') : `<p class="muted pad">Nothing due in the next 7 days.${S.bills.length ? '' : ' Add regular bills like rent, mobile or school fees under All bills.'}</p>`;
+  h += ub.length ? ub.map(billOccRow).join('') : `<p class="muted pad">Nothing due in the next 7 days.</p>`;
   h += `</section>`;
   return h;
 }
@@ -920,13 +1027,17 @@ function viewBudget() {
   h += `<section class="card"><div class="card-h"><h3>Where the salary goes</h3></div>
     <div class="stack">${lim.filter(x => x.L > 0).map(x => `<i style="flex:${x.L};background:${x.d.color}" title="${esc(x.d.name)}"></i>`).join('')}${free > 0 ? `<i style="flex:${free}" class="free"></i>` : ''}</div>
     <p class="${free < 0 ? 'over-t' : 'muted'}">${free >= 0 ? `${fmtR(free)} not given to any division yet.` : `Limits are ${fmtR(-free)} more than your income.`}</p></section>`;
-  h += `<section class="card list"><div class="card-h"><h3>Divisions</h3><button class="link" data-act="div-add">Add</button></div>`;
-  for (const { d, L } of lim) {
+  for (const [kind, title] of [['fixed', 'Fixed costs'], ['expense', 'Flexible spending'], ['savings', 'Savings']]) {
+  const grp = lim.filter(x => x.d.kind === kind); if (!grp.length && kind !== 'expense') continue;
+  h += `<section class="card list"><div class="card-h"><h3>${title}</h3><span class="muted small">${fmtR(grp.reduce((a, x) => a + x.L, 0))}</span></div>`;
+  for (const { d, L } of grp) {
     const ov = S.overrides[d.id + '|' + p.key] != null;
-    h += `<button class="drow" data-act="div-edit" data-id="${d.id}"><div class="drow-1">${dot(d.color)}<b>${esc(d.name)}</b><span class="muted small">${d.kind === 'savings' ? 'saving target' : 'spending limit'}</span></div>
+    h += `<button class="drow" data-act="div-edit" data-id="${d.id}"><div class="drow-1">${dot(d.color)}<b>${esc(d.name)}</b></div>
       <div class="drow-2"><span>${fmtR(L)}${d.limitMode === 'pct' ? ` <span class="muted">(${d.pct}% of salary)</span>` : ''}${ov ? ' <span class="muted">this period only</span>' : ''}${d.rollover === 'surplus' ? ' <span class="muted">+ leftover</span>' : ''}</span><span class="muted">${d.subs.length ? d.subs.length + ' sub-categories' : ''}</span></div></button>`;
   }
   h += `</section>`;
+  }
+  h += `<button class="btn wide" data-act="div-add">Add a division</button>`;
   const arch = S.divisions.filter(d => d.archived);
   if (arch.length) h += `<section class="card list"><div class="card-h"><h3>Archived</h3></div>${arch.map(d => `<button class="drow" data-act="div-edit" data-id="${d.id}"><div class="drow-1">${dot(d.color)}<b>${esc(d.name)}</b></div></button>`).join('')}</section>`;
   return h;
@@ -935,10 +1046,15 @@ function viewBudget() {
 // ---------------- Division detail ----------------
 function viewDivision(id) {
   const d = divById(id); if (!d) return '<p class="pad">Division not found.</p>';
-  const p = curPeriod(); const isSav = d.kind === 'savings';
-  const f = forecast(d, p); const s = isSav ? savingsStatus(d, p) : null;
-  let h = `<div class="dh">${dot(d.color)}<h2>${esc(d.name)}</h2>${chip(isSav ? s.status : f.status)}<button class="link" data-act="div-edit" data-id="${d.id}">Edit</button></div>`;
-  if (isSav) {
+  const p = curPeriod(); const isSav = d.kind === 'savings', isFix = d.kind === 'fixed';
+  const f = forecast(d, p); const s = isSav ? savingsStatus(d, p) : null; const fx = isFix ? fixedStatus(d, p) : null;
+  let h = `<div class="dh">${dot(d.color)}<h2>${esc(d.name)}</h2>${chip(isSav ? s.status : isFix ? fx.status : f.status)}<button class="link" data-act="div-edit" data-id="${d.id}">Edit</button></div>`;
+  if (isFix) {
+    const bills = S.bills.filter(b => b.div === d.id); const occ = bills.flatMap(b => billOccurrences(b, p.start, p.end));
+    h += `<section class="card"><div class="kv"><div><span>Planned</span><b>${fmtR(fx.limit)}</b></div><div><span>Paid</span><b>${fmtR(fx.paid)}</b></div><div><span>Still due</span><b>${fmtR(fx.due)}</b></div><div><span>Difference</span><b>${fx.extra ? '+' + fmtR(fx.extra) : '—'}</b></div></div>
+      <p class="muted small">A fixed cost is paid on a known date, so it isn't used to predict your daily spending. It only affects the overall pace if it's more than planned.</p>
+      ${occ.length ? occ.map(o => `<div class="brow"><div class="grow"><b>${esc(o.bill.name)}</b><div class="small muted">${o.status === 'paid' ? 'Paid' : (o.status === 'overdue' ? 'Was due ' : 'Due ') + niceDay(o.due)}</div></div><b>${fmtR(o.expected)}</b>${o.status !== 'paid' && o.status !== 'skipped' ? `<button class="btn sm" data-act="bill-pay" data-id="${o.bill.id}" data-due="${o.due}">Mark paid</button>` : ''}</div>`).join('') : `<p class="small">No bill set up for it. <button class="link" data-act="bill-add">Add a bill</button> so it shows as paid or due.</p>`}</section>`;
+  } else if (isSav) {
     h += `<section class="card"><div class="big">${fmtR(s.saved)}<span class="muted small"> of ${fmtR(s.limit)} target</span></div><div class="bar lg"><i style="width:${s.limit ? Math.min(100, s.saved / s.limit * 100) : 0}%;background:${d.color}"></i></div>${s.due ? `<p class="muted">${fmtR(s.due)} more scheduled as bills this period.</p>` : ''}</section>`;
   } else {
     h += `<section class="card"><div class="kv"><div><span>Spent</span><b>${fmtR(f.spent)}</b></div><div><span>Limit</span><b>${f.limit ? fmtR(f.limit) : '—'}</b></div><div><span>Expected</span><b>${fmtR(f.forecast)}</b></div><div><span>Safe a day</span><b>${!f.past && !f.future && f.limit ? fmtR(f.safePerDay) : '—'}</b></div></div>
@@ -961,10 +1077,10 @@ function viewDivision(id) {
 function viewInsights() {
   const p = curPeriod(); const { ids, f } = overall(p); let h = '';
   const items = expenseDivs().map(d => { const x = forecast(d, p); return { name: d.name, color: d.color, spent: x.spent, forecast: x.forecast, limit: x.limit, status: x.status }; });
-  h += `<section class="card"><div class="card-h"><h3>Where each division is heading</h3></div>${items.length ? forecastBars(items) : '<p class="muted">No divisions yet.</p>'}<p class="legend-line"><span class="lg solid"></span>spent <span class="lg soft"></span>expected by ${shortDay(p.end)} <span class="lg lim v"></span>limit</p></section>`;
-  const dn = expenseDivs().map(d => ({ name: d.name, color: d.color, value: spentFor(d.id, p) })); const un = unassignedSpent(p); if (un) dn.push({ name: 'No division', color: '#9AA3B5', value: un });
-  h += `<section class="card"><div class="card-h"><h3>Where the money went</h3><span class="muted">${p.label}</span></div>${donut(dn, kfmt(f.spent), 'spent')}</section>`;
-  h += `<section class="card"><div class="card-h"><h3>Spending by day</h3></div>${heatmap(p, dailyAll(ids, p))}</section>`;
+  h += `<section class="card"><div class="card-h"><h3>Where each flexible division is heading</h3></div>${items.length ? forecastBars(items) : '<p class="muted">No divisions yet.</p>'}<p class="legend-line"><span class="lg solid"></span>spent <span class="lg soft"></span>expected by ${shortDay(p.end)} <span class="lg lim v"></span>limit</p></section>`;
+  const dn = [...fixedDivs(), ...expenseDivs()].map(d => ({ name: d.name, color: d.color, value: spentFor(d.id, p) })); const un = unassignedSpent(p); if (un) dn.push({ name: 'No division', color: '#9AA3B5', value: un });
+  h += `<section class="card"><div class="card-h"><h3>Where the money went</h3><span class="muted">${p.label}</span></div>${donut(dn, kfmt(dn.reduce((a, i) => a + Math.max(0, i.value), 0)), 'spent')}</section>`;
+  h += `<section class="card"><div class="card-h"><h3>Flexible spending by day</h3></div>${heatmap(p, dailyAll(ids, p))}</section>`;
   const trend = [], sav = [];
   for (let i = 5; i >= 0; i--) {
     const pp = shiftPeriod(p, -i); if (i && pp.key < firstDataKey()) continue; const o = overall(pp);
@@ -972,7 +1088,7 @@ function viewInsights() {
     const sal = salaryFor(pp.key) + extraIncome(pp.key); const sv = savingsDivs().reduce((a, d) => a + spentFor(d.id, pp), 0);
     if (sal) sav.push({ label: MON[pp.m - 1], value: sv / sal * 100 });
   }
-  h += `<section class="card"><div class="card-h"><h3>Spending by period</h3></div>${trendBars(trend)}<p class="legend-line"><span class="lg lim"></span>total of limits</p></section>`;
+  h += `<section class="card"><div class="card-h"><h3>Flexible spending by period</h3></div>${trendBars(trend)}<p class="legend-line"><span class="lg lim"></span>total of flexible limits</p></section>`;
   if (sav.length) h += `<section class="card"><div class="card-h"><h3>Share of salary saved</h3></div>${lineChart(sav)}</section>`;
   const pay = {}; txnsIn(p).filter(t => t.dir === 'D' && !t.excl).forEach(t => { const k = t.payee || t.note || 'Unnamed'; pay[k] = (pay[k] || { n: 0, v: 0 }); pay[k].n++; pay[k].v += t.amt; });
   const top = Object.entries(pay).sort((a, b) => b[1].v - a[1].v).slice(0, 8);
@@ -1025,7 +1141,7 @@ function viewWelcome() {
   } else {
     const p = curPeriod(); const sal = salaryFor(p.key);
     h += `<h1>Divisions and limits</h1><p>How much each part of life can take each month. Savings divisions are targets to reach.</p><div id="onbDivs">`;
-    activeDivs().forEach(d => { h += `<div class="onb-div">${dot(d.color)}<input class="nm" data-id="${d.id}" value="${esc(d.name)}" aria-label="Division name"><input class="lm" data-id="${d.id}" inputmode="decimal" placeholder="₹ limit" value="${amtInput(d.limit)}" aria-label="Monthly amount for ${esc(d.name)}"><button class="icon" data-act="onb-del" data-id="${d.id}" aria-label="Remove ${esc(d.name)}">✕</button><span class="kind">${d.kind === 'savings' ? 'saving target' : 'spending limit'}</span></div>`; });
+    activeDivs().forEach(d => { h += `<div class="onb-div">${dot(d.color)}<input class="nm" data-id="${d.id}" value="${esc(d.name)}" aria-label="Division name"><input class="lm" data-id="${d.id}" inputmode="decimal" placeholder="₹ limit" value="${amtInput(d.limit)}" aria-label="Monthly amount for ${esc(d.name)}"><button class="icon" data-act="onb-del" data-id="${d.id}" aria-label="Remove ${esc(d.name)}">✕</button><span class="kind">${KIND_LABEL[d.kind]}</span></div>`; });
     h += `</div><button class="link" data-act="onb-adddiv">Add a division</button>
       <p class="muted" id="onbFree" data-sal="${sal}"></p>
       <button class="btn primary wide" data-act="onb-done">Finish</button>`;
@@ -1111,9 +1227,10 @@ function divSheet(id) {
   const d = id ? divById(id) : { name: '', kind: 'expense', color: PALETTE[S.divisions.length % PALETTE.length], limitMode: 'amt', limit: 0, pct: 0, rollover: 'off', alerts: true, subs: [], archived: false };
   const ov = id ? S.overrides[id + '|' + p.key] : null;
   const body = `<label class="fld"><span>Name</span><input id="dName" value="${esc(d.name)}"></label>
-    <div class="seg" id="dKind"><button type="button" class="${d.kind === 'expense' ? 'on' : ''}" data-v="expense">Spending limit</button><button type="button" class="${d.kind === 'savings' ? 'on' : ''}" data-v="savings">Saving target</button></div>
+    <div class="seg" id="dKind"><button type="button" class="${d.kind === 'fixed' ? 'on' : ''}" data-v="fixed">Fixed</button><button type="button" class="${d.kind === 'expense' ? 'on' : ''}" data-v="expense">Flexible</button><button type="button" class="${d.kind === 'savings' ? 'on' : ''}" data-v="savings">Savings</button></div>
+    <p class="muted small" id="dKindHelp"></p>
     <div class="lbl-s">Colour</div><div class="colors">${PALETTE.map(c => `<button type="button" class="cl${c === d.color ? ' on' : ''}" data-c="${c}" style="background:${c}" aria-label="Colour ${c}"></button>`).join('')}</div>
-    <div class="seg" id="dMode"><button type="button" class="${d.limitMode === 'amt' ? 'on' : ''}" data-v="amt">Fixed amount</button><button type="button" class="${d.limitMode === 'pct' ? 'on' : ''}" data-v="pct">% of salary</button></div>
+    <div class="seg" id="dMode"><button type="button" class="${d.limitMode === 'amt' ? 'on' : ''}" data-v="amt">Amount</button><button type="button" class="${d.limitMode === 'pct' ? 'on' : ''}" data-v="pct">% of salary</button></div>
     <div class="row2"><label class="fld"><span>Every month (₹)</span><input id="dLimit" inputmode="decimal" value="${amtInput(d.limit)}"></label><label class="fld"><span>% of salary</span><input id="dPct" inputmode="decimal" value="${d.pct || ''}"></label></div>
     <label class="fld"><span>Only for ${p.label} (₹, leave empty for normal)</span><input id="dOv" inputmode="decimal" value="${ov != null ? amtInput(ov) : ''}"></label>
     <label class="chk"><input type="checkbox" id="dRoll" ${d.rollover === 'surplus' ? 'checked' : ''}> Add last period's unspent money to this period</label>
@@ -1131,7 +1248,10 @@ function divSheet(id) {
     commit('Saved ' + name);
   });
   const sh = $('#sheet');
-  ['#dKind', '#dMode'].forEach(g => sh.querySelectorAll(g + ' button').forEach(b => b.onclick = () => sh.querySelectorAll(g + ' button').forEach(x => x.classList.toggle('on', x === b))));
+  const KH = { fixed: 'Paid on a known date, like rent, EMI or school fees. Shown as paid or due, never used to predict daily spending.', expense: 'Day-to-day spending, like groceries or commute. Tracked against the month\'s pace with a forecast.', savings: 'Money you set aside, like SIPs or FDs. A target to reach.' };
+  const kh = () => { $('#dKindHelp').textContent = KH[$('#dKind .on').dataset.v]; };
+  ['#dKind', '#dMode'].forEach(g => sh.querySelectorAll(g + ' button').forEach(b => b.onclick = () => { sh.querySelectorAll(g + ' button').forEach(x => x.classList.toggle('on', x === b)); kh(); }));
+  kh();
   sh.querySelectorAll('.cl').forEach(b => b.onclick = () => sh.querySelectorAll('.cl').forEach(x => x.classList.toggle('on', x === b)));
   $('#dAddSub').onclick = () => { $('#dSubs').insertAdjacentHTML('beforeend', `<div class="subrow"><input value="" placeholder="Name"><button type="button" class="icon" data-delsub aria-label="Remove">✕</button></div>`); $('#dSubs input:last-of-type') && $$('#dSubs input').pop().focus(); };
   $('#dSubs').onclick = e => { if (e.target.closest('[data-delsub]')) e.target.closest('.subrow').remove(); };
@@ -1423,7 +1543,12 @@ const ACT = {
   'salary-edit': () => salarySheet(), 'income-add': () => incomeSheet(),
   'income-del': el => { S.income = S.income.filter(i => i.id !== el.dataset.id); commit('Removed'); },
   'div-add': () => divSheet(null), 'div-edit': el => divSheet(el.dataset.id),
-  'bill-add': () => billSheet(null), 'bill-edit': el => billSheet(el.dataset.id), 'bill-pay': el => payBillSheet(el.dataset.id, el.dataset.due),
+  'bill-add': () => billSheet(null),
+  'link-bill': async el => {
+    const t = S.txns.find(x => x.id === el.dataset.t), b = S.bills.find(x => x.id === el.dataset.b); if (!t || !b) return;
+    if (await confirmBox(`Mark ${b.name} paid?`, `${fmt(t.amt)}${t.payee ? ' to ' + t.payee : ''} on ${shortDay(t.dt)} will count as ${b.name}` + (b.div ? ` and move to ${(divById(b.div) || {}).name}.` : '.'), 'Yes, it is')) { linkTxnToBill(t.id, b.id, el.dataset.due); commit(b.name + ' marked paid'); }
+    else { S.dismissedLinks = S.dismissedLinks || []; S.dismissedLinks.push(t.id + '|' + b.id); commit(); }
+  }, 'bill-edit': el => billSheet(el.dataset.id), 'bill-pay': el => payBillSheet(el.dataset.id, el.dataset.due),
   'imp-filter': el => { UI.impFilter = el.dataset.f; render(); },
   'imp-cancel': () => { UI.importSession = null; render(); },
   'imp-commit': () => importCommit(), 'imp-undo': el => importUndo(el.dataset.id),
@@ -1468,8 +1593,8 @@ document.addEventListener('click', e => {
 document.addEventListener('change', e => {
   const el = e.target; const a = el.dataset.act; const ses = UI.importSession;
   if (el.id === 'actDiv') { UI.actDiv = el.value; render(); return; }
-  if (el.id === 'pdfIn' && el.files[0]) { importFile(el.files[0]); return; }
-  if (el.id === 'restoreIn' && el.files[0]) { el.files[0].text().then(t => { let o = null; try { o = JSON.parse(t); } catch { } restoreState(o, el.files[0].name); }); return; }
+  if (el.id === 'pdfIn' && el.files[0]) { const f = el.files[0]; el.value = ''; importFile(f); return; }
+  if (el.id === 'restoreIn' && el.files[0]) { const f = el.files[0]; el.value = ''; f.text().then(t => { let o = null; try { o = JSON.parse(t); } catch { } restoreState(o, f.name); }); return; }
   if (!a) return;
   if (a === 'imp-inc') { const r = ses.rows.find(x => x.key === el.dataset.key); r.include = el.checked; render(); }
   if (a === 'imp-div') { const r = ses.rows.find(x => x.key === el.dataset.key); r.div = el.value || null; r.sub = null; r.manualDiv = true; render(); }
